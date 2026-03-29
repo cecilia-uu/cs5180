@@ -116,6 +116,58 @@ def compute_spc(results):
             spc_values.append(0.0)  # both zero = perfect
     return 100.0 * np.mean(spc_values)
 
+def multi_start_optimize(model, graph_path, embeddings, 
+                         n_starts=5, max_steps=300):
+    best_crossings = float('inf')
+    best_result = None
+    
+    # 先记录neato原始crossing数
+    env_base = GraphLayoutEnvFixed(
+        [graph_path],
+        embeddings=embeddings,
+        max_steps=max_steps,
+        move_scale=2.0,
+        patience=50,
+    )
+    obs, _ = env_base.reset()
+    neato_crossings = env_base.current_crossings  # 保存原始neato结果
+    
+    for i in range(n_starts):
+        env = GraphLayoutEnvFixed(
+            [graph_path],
+            embeddings=embeddings,
+            max_steps=max_steps,
+            move_scale=2.0,
+            patience=50,
+        )
+        obs, _ = env.reset()
+        
+        # 第一次用原始neato，后面加扰动
+        if i > 0:
+            noise = np.random.randn(*env.coords.shape) * env.coords.std() * 0.1
+            env.coords += noise.astype(np.float32)
+            env.current_crossings = env._compute_crossings(env.coords)
+            env.best_crossings = env.current_crossings
+            obs = env._get_obs()
+        
+        done = False
+        truncated = False
+        while not (done or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, truncated, info = env.step(action)
+        
+        if info['best_crossings'] < best_crossings:
+            best_crossings = info['best_crossings']
+            best_result = {
+                "graph_name": os.path.basename(graph_path),
+                "neato_crossings": neato_crossings,  # 始终用原始neato
+                "best_crossings": info['best_crossings'],
+                "improvement": neato_crossings - info['best_crossings'],
+                "crossing_history": [],
+                "steps": info['steps'],
+            }
+    
+    return best_result
 
 def plot_result(result, save_path=None):
     plt.figure(figsize=(10, 5))
@@ -168,7 +220,9 @@ def evaluate_test_set(model, rome_dir, embeddings, max_steps=300):
     wins, ties, losses = 0, 0, 0
 
     for gpath in test_paths:
-        r = test_on_graph(model, gpath, embeddings, max_steps=max_steps)
+        # multi_start_optimize
+        r = multi_start_optimize(model, gpath, embeddings, 
+                         n_starts=10, max_steps=max_steps)
         results.append(r)
 
         imp = r["improvement"]
@@ -205,6 +259,25 @@ def evaluate_test_set(model, rome_dir, embeddings, max_steps=300):
     print(f"  Avg improvement    : {avg_imp:.1f}")
     print(f"{'=' * 70}")
 
+    # 按节点数排序
+    results_sorted = sorted(results, key=lambda r: nx.read_graphml(
+        os.path.join(rome_dir, r['graph_name'])).number_of_nodes())
+
+    ratios_ours = [(r['best_crossings'] - r['neato_crossings']) / 
+                max(r['best_crossings'], r['neato_crossings'], 1) 
+                for r in results_sorted]
+
+    plt.figure(figsize=(10, 5))
+    plt.scatter(range(len(ratios_ours)), ratios_ours, 
+                alpha=0.7, color='pink', marker='^', label='ours (PPO)')
+    plt.axhline(y=0, color='black', linestyle='--')
+    plt.xlabel("Graph index (sorted by num_nodes, ascending)")
+    plt.ylabel("Ratio vs neato (negative = better than neato)")
+    plt.title("Per-graph ratio vs neato baseline")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig("spc_scatter_ours.png", dpi=150)
+    plt.show()
     return spc, results
 
 

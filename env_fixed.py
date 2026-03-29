@@ -54,14 +54,15 @@ class GraphLayoutEnvFixed(gym.Env):
 
         # Action: [node_selector, delta_x, delta_y]
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
         self.G = None
         self.n_nodes = None
         self.xing_loss = None
+        self.xing_loss_soft = None
         self.coords = None
         self.current_crossings = None
         self.initial_crossings = None
@@ -125,9 +126,14 @@ class GraphLayoutEnvFixed(gym.Env):
         self.G = self._load_graph(graph_path)
         self.n_nodes = self.G.number_of_nodes()
         self.xing_loss = XingLoss(self.G, soft=False)
+        self.xing_loss_soft = XingLoss(self.G, soft=True)
 
         pos = nx.nx_agraph.graphviz_layout(self.G, prog="neato")
         self.coords = self._pos_to_coords(pos)
+
+        # # 加随机扰动（multi-start的关键）
+        # noise_scale = self.coords.std() * 0.1  # 扰动幅度=坐标标准差的10%
+        # self.coords += np.random.randn(*self.coords.shape) * noise_scale
 
         self.current_crossings = self._compute_crossings(self.coords)
         self.initial_crossings = self.current_crossings
@@ -144,53 +150,49 @@ class GraphLayoutEnvFixed(gym.Env):
             self._node_emb = torch.zeros(self.n_nodes, self.emb_dim)
         else:
             self._node_emb = None
-
+        self._crossing_per_node = np.zeros(self.n_nodes)
         return self._get_obs(), {}
 
     def step(self, action):
-        # Decode action
-        node_idx = int((action[0] + 1) / 2 * self.n_nodes)
-        node_idx = np.clip(node_idx, 0, self.n_nodes - 1)
-        delta_x = float(action[1]) * self.move_scale
-        delta_y = float(action[2]) * self.move_scale
+        # 每10步重新计算一次，避免太慢
+        if self.steps % 10 == 0:
+            self._crossing_per_node = self._compute_per_node_crossings()
+        node_idx = int(np.argmax(self._crossing_per_node))
+        
+        delta_x = float(action[0]) * self.move_scale
+        delta_y = float(action[1]) * self.move_scale
 
+        old_soft = self._compute_soft_crossings(self.coords)
         old_crossings = self.current_crossings
 
-        # Apply move (always accept — agent needs to explore)
         self.coords[node_idx, 0] += delta_x
         self.coords[node_idx, 1] += delta_y
         self.current_crossings = self._compute_crossings(self.coords)
+        new_soft = self._compute_soft_crossings(self.coords)
 
-        # ── Reward shaping ──
-        crossing_delta = old_crossings - self.current_crossings  # positive = good
+        crossing_delta = old_crossings - self.current_crossings
 
         if self.current_crossings < self.best_crossings:
-            # NEW BEST — big bonus!
-            reward = 20.0 + crossing_delta * 5.0
+            reward = 20.0 + (old_soft - new_soft) * 5.0
             self.best_crossings = self.current_crossings
             self.best_coords = self.coords.copy()
             self.no_improve_steps = 0
         elif crossing_delta > 0:
-            # Improved but not new best
-            reward = crossing_delta * 5.0
+            reward = (old_soft - new_soft) * 5.0
             self.no_improve_steps = 0
         elif crossing_delta == 0:
-            # No change — small penalty for wasting a step
-            reward = -0.1
+            reward = (old_soft - new_soft) * 2.0 - 0.1
             self.no_improve_steps += 1
         else:
-            # Got worse — penalty proportional to how much worse
-            reward = crossing_delta * 2.0  # negative since delta is negative
+            reward = (old_soft - new_soft) * 2.0
             self.no_improve_steps += 1
 
         self.steps += 1
-
         terminated = bool(self.current_crossings == 0)
         truncated = bool(
             self.steps >= self.max_steps or self.no_improve_steps >= self.patience
         )
 
-        # If episode ends, restore best coords
         if terminated or truncated:
             self.coords = self.best_coords.copy()
             self.current_crossings = self.best_crossings
@@ -204,7 +206,7 @@ class GraphLayoutEnvFixed(gym.Env):
         }
 
         return self._get_obs(), float(reward), terminated, truncated, info
-
+    
     def render(self):
         import matplotlib.pyplot as plt
         nodes = list(self.G.nodes())
@@ -215,3 +217,43 @@ class GraphLayoutEnvFixed(gym.Env):
                 node_size=30, node_color="lightblue", edge_color="gray")
         plt.title(f"Crossings: {int(self.current_crossings)} (best: {int(self.best_crossings)})")
         plt.show()
+    
+    def _compute_per_node_crossings(self):
+        """计算每个节点参与的crossing数"""
+        crossing_per_node = np.zeros(self.n_nodes)
+        coords_tensor = torch.tensor(self.coords, dtype=torch.float32)
+        
+        edges = list(self.G.edges())
+        for i, (u, v) in enumerate(edges):
+            for j, (a, b) in enumerate(edges):
+                if j <= i:
+                    continue
+                if u == a or u == b or v == a or v == b:
+                    continue
+                # 检查边i和边j是否相交
+                p1, p2 = self.coords[u], self.coords[v]
+                p3, p4 = self.coords[a], self.coords[b]
+                if self._segments_intersect(p1, p2, p3, p4):
+                    crossing_per_node[u] += 1
+                    crossing_per_node[v] += 1
+                    crossing_per_node[a] += 1
+                    crossing_per_node[b] += 1
+        return crossing_per_node
+
+    def _segments_intersect(self, p1, p2, p3, p4):
+        """判断两条线段是否相交"""
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+        d1 = cross(p3, p4, p1)
+        d2 = cross(p3, p4, p2)
+        d3 = cross(p1, p2, p3)
+        d4 = cross(p1, p2, p4)
+        if ((d1>0 and d2<0) or (d1<0 and d2>0)) and \
+        ((d3>0 and d4<0) or (d3<0 and d4>0)):
+            return True
+        return False
+    
+    def _compute_soft_crossings(self, coords):
+        coords_tensor = torch.tensor(coords, dtype=torch.float32)
+        with torch.no_grad():
+            return self.xing_loss_soft(coords_tensor).item()
