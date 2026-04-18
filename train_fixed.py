@@ -280,6 +280,60 @@ def evaluate_test_set(model, rome_dir, embeddings, max_steps=300):
     plt.show()
     return spc, results
 
+def save_coords(model, rome_dir, embeddings, 
+                output_dir="coords", n_starts=10):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    test_paths = get_graph_paths(rome_dir, 
+                                  min_idx=10000, 
+                                  max_idx=10100)
+    
+    for gpath in test_paths:
+        # 用multi-start找最好布局
+        result = multi_start_optimize(
+            model, gpath, embeddings, 
+            n_starts=n_starts
+        )
+        
+        # 获取最好的坐标
+        env = GraphLayoutEnvFixed(
+            [gpath], embeddings=embeddings,
+            max_steps=300, move_scale=2.0, patience=50
+        )
+        obs, _ = env.reset()
+        
+        # 重新跑一次得到best_coords
+        done = False
+        truncated = False
+        while not (done or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, truncated, info = env.step(action)
+        
+        # 保存坐标
+        graph_name = os.path.basename(gpath).replace('.graphml', '')
+        coord_file = os.path.join(output_dir, f"{graph_name}.coord")
+        
+        G = env.G
+        nodes = list(G.nodes())
+        with open(coord_file, 'w') as f:
+            for i, node in enumerate(nodes):
+                x, y = env.best_coords[i]
+                f.write(f"{node} {x:.6f} {y:.6f}\n")
+        
+        print(f"Saved {coord_file}")
+    
+    print(f"Done! {len(test_paths)} coord files saved.")
+
+def check_overlapping(coords, threshold=1.0):
+    """检查是否有节点重叠"""
+    n = len(coords)
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.sqrt((coords[i,0]-coords[j,0])**2 + 
+                          (coords[i,1]-coords[j,1])**2)
+            if dist < threshold:
+                return True  # 有重叠
+    return False
 
 def main():
     parser = argparse.ArgumentParser()
